@@ -1,0 +1,309 @@
+
+import numpy as np
+from collections import defaultdict
+import csv
+from math import pi
+
+TAU = 2.0 * pi
+
+# ============================================================
+# Full Hex/EW FP Harness with Arclength N⋆ Resonance + Coherence
+# ============================================================
+
+# ---- Torus helpers ------------------------------------------------
+def wrap_points(points, L):
+    return np.asarray(points, float) % L
+
+def torus_disp(a, b, L):
+    d = np.asarray(b, float) - np.asarray(a, float)
+    return (d + 0.5 * L) % L - 0.5 * L
+
+def torus_dist(a, b, L):
+    return float(np.linalg.norm(torus_disp(a, b, L)))
+
+# ---- Placeholder for your Voronoi / neighbor functions ------------
+# Replace these with your exact implementations
+def periodic_voronoi_data(points, L, rng=None, retries=6, jitter=1e-10):
+    # Your full function here (returns polys, coord, edge_lengths, neighbors)
+    raise NotImplementedError("Insert your periodic_voronoi_data")
+
+def filter_neighbors_by_distance(points, neighbors, L, dist_quantile=0.85, hard_max=0.35):
+    # Your full function here
+    raise NotImplementedError("Insert your filter_neighbors_by_distance")
+
+# ---- Ring ordering ------------------------------------------------
+def neighbor_ring(points, i, neighbors_i, L):
+    nbrs = list(neighbors_i)
+    if len(nbrs) < 3:
+        return None
+    vecs = [torus_disp(points[i], points[j], L) for j in nbrs]
+    angs = [np.arctan2(v[1], v[0]) for v in vecs]
+    order = np.argsort(angs)
+    return [nbrs[k] for k in order]
+
+# ---- Arclength fractions ------------------------------------------
+def ring_arclength_fractions(points, ring, L):
+    S = len(ring)
+    if S < 3:
+        return np.zeros(0, float)
+    ell = np.zeros(S, float)
+    for s in range(S):
+        j = ring[s]
+        k = ring[(s + 1) % S]
+        ell[s] = torus_dist(points[j], points[k], L)
+    Ltot = float(np.sum(ell) + 1e-30)
+    csum = np.cumsum(np.concatenate(([0.0], ell[:-1])))
+    u_mid = (csum + 0.5 * ell) / Ltot
+    return u_mid % 1.0
+
+# ---- Axis winding -------------------------------------------------
+def axis_winding_arclength(Nstar, u, axis0=np.array([0.0, 0.0, 1.0]),
+                           axis1=np.array([1.0, 0.0, 0.0])):
+    phi = TAU * float(Nstar) * float(u)
+    a = np.cos(phi) * axis0 + np.sin(phi) * axis1
+    return a / (np.linalg.norm(a) + 1e-30)
+
+# ---- Coherence factor ---------------------------------------------
+def coherence_factor_C(axes):
+    axes = np.asarray(axes, float)
+    S = axes.shape[0]
+    if S == 0:
+        return np.nan
+    return float(np.linalg.norm(np.sum(axes, axis=0)) / S)
+
+# ---- SU(2) helpers ------------------------------------------------
+def q_norm(q):
+    return q / (np.linalg.norm(q) + 1e-30)
+
+def q_mul(q1, q2):
+    a1,b1,c1,d1 = q1; a2,b2,c2,d2 = q2
+    return np.array([
+        a1*a2 - b1*b2 - c1*c2 - d1*d2,
+        a1*b2 + b1*a2 + c1*d2 - d1*c2,
+        a1*c2 - b1*d2 + c1*a2 + d1*b2,
+        a1*d2 + b1*c2 - c1*b2 + d1*a2
+    ], float)
+
+def su2_from_axis_angle(axis, angle):
+    axis = np.asarray(axis, float) / (np.linalg.norm(axis) + 1e-30)
+    h = 0.5 * angle
+    return np.array([np.cos(h), *(np.sin(h) * axis)], float)
+
+def q_lerp(a, b, lam):
+    return q_norm((1.0 - lam) * a + lam * b)
+
+def theta_from_q(q):
+    return float(2.0 * np.arccos(np.clip(q[0], -1.0, 1.0)))
+
+def H_clean_from_theta(theta):
+    return float(1.0 - np.cos(0.5 * theta))
+
+# ---- Doublet helpers ----------------------------------------------
+def su2_act_on_doublet(q, z):
+    a,b,c,d = q
+    z1,z2 = z
+    return np.array([
+        (a + 1j*d)*z1 + (c + 1j*b)*z2,
+        (-c + 1j*b)*z1 + (a - 1j*d)*z2
+    ], np.complex128)
+
+def normalize_doublet(z):
+    n = np.sqrt(np.abs(z[0])**2 + np.abs(z[1])**2 + 1e-30)
+    return z / n
+
+def doublet_mismatch(zi, zj):
+    inner = np.vdot(zi, zj)
+    return float(1.0 - np.abs(inner)**2)
+
+# ---- Phi relaxation -----------------------------------------------
+def relax_phi_complex(Phi, neighbors, steps=120, lr=0.15, lam=0.02):
+    Phi = Phi.copy()
+    for _ in range(steps):
+        grad = np.zeros_like(Phi)
+        for i in range(len(Phi)):
+            nbs = list(neighbors[i])
+            if nbs:
+                grad[i] += 2.0 * (Phi[i] - np.mean(Phi[nbs], axis=0))
+        grad += 2.0 * lam * Phi
+        Phi -= lr * grad
+        Phi /= np.sqrt(np.mean(np.abs(Phi)**2) + 1e-30)
+    return Phi
+
+# ---- Fixed-point update with arclength axis -----------------------
+def fp_update_arclength(U_dir, Delta_dir, rings_by_site, points, L,
+                        alpha, Nstar=0, lam=0.35, n_fp=8):
+    axis0 = np.array([0.0, 0.0, 1.0])
+    axis1 = np.array([1.0, 0.0, 0.0])
+    for _ in range(n_fp):
+        U_new = dict(U_dir)
+        for i, ring in rings_by_site.items():
+            S = len(ring)
+            if S < 3: continue
+            u_mid = ring_arclength_fractions(points, ring, L)
+            for s in range(S):
+                j = ring[s]; k = ring[(s + 1) % S]
+                delta = Delta_dir.get((j, k), 0.0)
+                ang = alpha * delta
+                ax = (axis_winding_arclength(Nstar, u_mid[s], axis0, axis1)
+                      if Nstar != 0 else axis0)
+                Q = su2_from_axis_angle(ax, ang)
+                U_old = U_dir.get((j, k), np.array([1,0,0,0], float))
+                U_prop = q_norm(q_mul(Q, U_old))
+                U_new[(j, k)] = q_lerp(U_old, U_prop, lam)
+        U_dir = U_new
+    return U_dir
+
+# ---- Cross-channel + coherence ------------------------------------
+def compute_metrics(Delta_dir, U_dir, rings_by_site, points, L, Nstar):
+    sites, Ds, Hs, Cs = [], [], [], []
+    for i, ring in rings_by_site.items():
+        S = len(ring)
+        if S < 3: continue
+        # spoke D
+        D = np.mean([Delta_dir.get((i, j), 0.0) for j in ring])
+        # ring holonomy
+        U = np.array([1,0,0,0], float)
+        axes = []
+        u_mid = ring_arclength_fractions(points, ring, L)
+        axis0 = np.array([0.0,0.0,1.0]); axis1 = np.array([1.0,0.0,0.0])
+        for s in range(S):
+            j = ring[s]; k = ring[(s + 1) % S]
+            ax = (axis_winding_arclength(Nstar, u_mid[s], axis0, axis1)
+                  if Nstar != 0 else axis0)
+            axes.append(ax)
+            U = q_mul(U, U_dir.get((j, k), np.array([1,0,0,0], float)))
+        U = q_norm(U)
+        theta = theta_from_q(U)
+        H = H_clean_from_theta(theta)
+        C = coherence_factor_C(axes)
+        sites.append(i); Ds.append(D); Hs.append(H); Cs.append(C)
+    return np.array(sites), np.array(Ds), np.array(Hs), np.array(Cs)
+
+# ---- Correlations -------------------------------------------------
+def corr_pearson(x, y):
+    x = x - x.mean(); y = y - y.mean()
+    return float(np.dot(x,y) / (np.linalg.norm(x)*np.linalg.norm(y) + 1e-30))
+
+def corr_spearman(x, y):
+    rx = x.argsort().argsort()
+    ry = y.argsort().argsort()
+    return corr_pearson(rx.astype(float), ry.astype(float))
+
+# ---- Single run ---------------------------------------------------
+def run_one(seed, Nstar, alpha, N=300, L=1.0):
+    rng = np.random.default_rng(seed)
+    points = rng.random((N, 2)) * L
+
+    # Geometry
+    _, _, _, neighbors = periodic_voronoi_data(points, L, rng=rng)
+    neighbors_f, _ = filter_neighbors_by_distance(points, neighbors, L)
+
+    rings_by_site = {i: neighbor_ring(points, i, neighbors_f[i], L)
+                     for i in range(N) if neighbor_ring(points, i, neighbors_f[i], L)}
+
+    # Phi
+    Phi = rng.normal(size=(N,2)) + 1j * rng.normal(size=(N,2))
+    Phi /= np.sqrt(np.mean(np.abs(Phi)**2) + 1e-30)
+    Phi = relax_phi_complex(Phi, neighbors_f)
+
+    PhiN = np.array([normalize_doublet(Phi[k]) for k in range(N)])
+
+    # Initial Delta_dir (bare mismatch)
+    Delta_dir = {}
+    for i, ring in rings_by_site.items():
+        for j in ring:
+            key = tuple(sorted((i,j)))
+            if key not in {(tuple(sorted((a,b)))) for a,b in Delta_dir}:
+                dij = doublet_mismatch(PhiN[i], PhiN[j])
+                Delta_dir[(i,j)] = dij
+                Delta_dir[(j,i)] = dij
+
+    # Init U_dir
+    U_dir = {}
+    for i, ring in rings_by_site.items():
+        S = len(ring)
+        for s in range(S):
+            j = ring[s]; k = ring[(s + 1) % S]
+            U_dir[(j, k)] = np.array([1,0,0,0], float)
+
+    # FP
+    U_dir = fp_update_arclength(U_dir, Delta_dir, rings_by_site, points, L,
+                                alpha=alpha, Nstar=Nstar)
+
+    # Metrics
+    sites, Dsp, H, C = compute_metrics(Delta_dir, U_dir, rings_by_site, points, L, Nstar)
+
+    pearson = corr_pearson(Dsp, H)
+    spearman = corr_spearman(Dsp, H)
+    theta_mean = np.mean(theta_from_q(np.array([q for q in U_dir.values()]))) if U_dir else np.nan
+
+    return {
+        "summary": {
+            "pearson": pearson,
+            "spearman": spearman,
+            "theta_mean": np.mean([theta_from_q(U_dir.get((ring[s], ring[(s+1)%len(ring)]),
+                          np.array([1,0,0,0],float))) for ring in rings_by_site.values()
+                          for s in range(len(ring))]) if U_dir else np.nan,
+            "n_loops": len(Dsp),
+            "coherence_mean": float(np.mean(C)),
+        }
+    }
+
+# ---- Robustness cube ----------------------------------------------
+def run_robustness_cube(
+    seeds=(41, 42, 43),
+    Nstars=(0, 105, 777, 811, 897),
+    alphas=(1.00, 1.05, 1.10),
+    rows_csv="cube_rows.csv",
+    agg_csv="cube_agg.csv"
+):
+    rows = []
+    bucket = {}
+
+    for Nstar in Nstars:
+        for alpha in alphas:
+            for seed in seeds:
+                out = run_one(seed=seed, Nstar=Nstar, alpha=alpha)
+                s = out["summary"]
+                row = {
+                    "seed": seed, "Nstar": Nstar, "alpha": alpha,
+                    "pearson": s["pearson"], "spearman": s["spearman"],
+                    "theta_mean": s["theta_mean"], "n_loops": s["n_loops"],
+                    "coherence_mean": s["coherence_mean"]
+                }
+                rows.append(row)
+
+                key = (Nstar, alpha)
+                bucket.setdefault(key, {"pearson": [], "spearman": [], "theta_mean": [],
+                                        "n_loops": [], "coherence": []})
+                bucket[key]["pearson"].append(s["pearson"])
+                bucket[key]["spearman"].append(s["spearman"])
+                bucket[key]["theta_mean"].append(s["theta_mean"])
+                bucket[key]["n_loops"].append(s["n_loops"])
+                bucket[key]["coherence"].append(s["coherence_mean"])
+
+    # Per-run CSV
+    with open(rows_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
+
+    # Aggregated
+    agg = []
+    for (Nstar, alpha), d in sorted(bucket.items()):
+        agg.append({
+            "Nstar": Nstar, "alpha": alpha,
+            "pearson_mean": np.mean(d["pearson"]), "pearson_std": np.std(d["pearson"], ddof=1),
+            "spearman_mean": np.mean(d["spearman"]), "spearman_std": np.std(d["spearman"], ddof=1),
+            "theta_mean": np.mean(d["theta_mean"]), "coherence_mean": np.mean(d["coherence"])
+        })
+
+    with open(agg_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=agg[0].keys())
+        w.writeheader()
+        w.writerows(agg)
+
+    print(f"Saved {rows_csv} and {agg_csv}")
+
+if __name__ == "__main__":
+    run_robustness_cube()
