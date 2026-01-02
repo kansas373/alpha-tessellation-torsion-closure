@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the associated paper."
+title: "Emergent Holonomy from Local Field Mismatch"
+version: 1.0.0
+date-released: 2026-01-01
+doi: 10.5281/zenodo.18131868
+
+authors:
+  - family-names: Cullor
+    given-names: Stephen M.
+    orcid: ""
+
+repository-code: "https://github.com/kansas373/emergent-holonomy-from-local-field-mismatch"
+
+abstract: >
+  This repository accompanies the paper “Emergent Holonomy from Local Field
+  Mismatch,” implementing a self-consistent torsion–holonomy closure on an
+  alpha / hexagonal tessellation. The code demonstrates cross-channel
+  predictivity between local field mismatch and closed-loop transport, and
+  reveals integer-selective resonance in path-ordered SU(2) holonomy
+  accumulation without stochastic assumptions or quantum postulates.
+
+license: MIT
+
+preferred-citation:
+  type: article
+  title: "Emergent Holonomy from Local Field Mismatch"
+  authors:
+    - family-names: Cullor
+      given-names: Stephen M.
+  doi: 10.5281/zenodo.18131868
+  year: 2026
